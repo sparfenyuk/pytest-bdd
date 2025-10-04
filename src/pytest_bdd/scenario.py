@@ -14,16 +14,26 @@ test_publish_article = scenario(
 from __future__ import annotations
 
 import contextlib
+import inspect
 import logging
 import os
 import re
 from collections.abc import Iterable, Iterator
 from inspect import signature
-from typing import TYPE_CHECKING, Callable, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
 from weakref import WeakKeyDictionary
 
 import pytest
 from _pytest.fixtures import FixtureDef, FixtureManager, FixtureRequest, call_fixture_func
+
+# Conditional import for anyio (optional dependency for async support)
+try:
+    import anyio
+
+    ANYIO_AVAILABLE = True
+except ImportError:
+    ANYIO_AVAILABLE = False
+    anyio = None  # type: ignore
 
 from . import exceptions
 from .compat import getfixturedefs, inject_fixture
@@ -205,6 +215,91 @@ def parse_step_arguments(step: Step, context: StepFunctionContext) -> dict[str, 
     return converted_args
 
 
+def _call_step_function(
+    step_func: Callable[..., Any],
+    is_async: bool,
+    kwargs: dict[str, Any],
+    request: FixtureRequest,
+) -> Any:
+    """Execute step function, handling both sync and async cases.
+
+    :param step_func: The step function to execute
+    :param is_async: Whether the step function is async
+    :param kwargs: Arguments to pass to the step function
+    :param request: pytest fixture request
+    :return: The return value from the step function
+    """
+    # Check if any kwargs are coroutines or async generators (async fixtures) and await them
+    # This handles async fixtures properly, including async generator fixtures
+    resolved_kwargs = {}
+    has_async_fixtures = False
+
+    for key, value in kwargs.items():
+        if inspect.iscoroutine(value) or inspect.isasyncgen(value):
+            has_async_fixtures = True
+            resolved_kwargs[key] = value
+        else:
+            resolved_kwargs[key] = value
+
+    # If we have async fixtures, we need to await them
+    if has_async_fixtures:
+        if not ANYIO_AVAILABLE:
+            raise exceptions.StepImplementationError(
+                f"Step function {step_func.__name__!r} uses async fixtures which require 'anyio' to be installed. "
+                f"Install it with: pip install pytest-bdd[async] or pip install anyio"
+            )
+
+        async def resolve_async_fixtures() -> dict[str, Any]:
+            result = {}
+            for key, value in resolved_kwargs.items():
+                if inspect.iscoroutine(value):
+                    result[key] = await value
+                elif inspect.isasyncgen(value):
+                    # For async generators, we need to iterate once to get the yielded value
+                    try:
+                        result[key] = await value.__anext__()
+                    except StopAsyncIteration:
+                        raise exceptions.StepImplementationError(
+                            f"Async generator fixture '{key}' did not yield a value. "
+                            f"Ensure the fixture uses 'yield' and not 'return'."
+                        ) from None
+                else:
+                    result[key] = value
+            return result
+
+        resolved_kwargs = anyio.run(resolve_async_fixtures)
+
+        # Inject the resolved async fixture values back into the fixture cache
+        # so subsequent steps can reuse them without re-awaiting
+        for key, value in resolved_kwargs.items():
+            if key in kwargs and (inspect.iscoroutine(kwargs[key]) or inspect.isasyncgen(kwargs[key])):
+                inject_fixture(request, key, value)
+
+    if not is_async:
+        # Sync step - use existing pytest behavior
+        return call_fixture_func(fixturefunc=step_func, request=request, kwargs=resolved_kwargs)
+
+    # Async step handling
+    if not ANYIO_AVAILABLE:
+        raise exceptions.StepImplementationError(
+            f"Async step function {step_func.__name__!r} requires 'anyio' to be installed. "
+            f"Install it with: pip install pytest-bdd[async] or pip install anyio"
+        )
+
+    # Check for async generators (not supported yet)
+    if inspect.isasyncgenfunction(step_func):
+        raise exceptions.StepImplementationError(
+            f"Async generator step functions (with 'yield') are not yet supported. "
+            f"Step function: {step_func.__name__!r}"
+        )
+
+    # Run the async function using anyio
+    async def run_step() -> Any:
+        return await step_func(**kwargs)
+
+    return anyio.run(run_step)
+
+
 def _execute_step_function(
     request: FixtureRequest, scenario: Scenario, step: Step, context: StepFunctionContext
 ) -> None:
@@ -243,9 +338,13 @@ def _execute_step_function(
 
         request.config.hook.pytest_bdd_before_step_call(**kw)
 
-        # Execute the step as if it was a pytest fixture using `call_fixture_func`,
-        # so that we can allow "yield" statements in it
-        return_value = call_fixture_func(fixturefunc=context.step_func, request=request, kwargs=kwargs)
+        # Execute the step function - handles both sync and async steps
+        return_value = _call_step_function(
+            step_func=context.step_func,
+            is_async=context.is_async,
+            kwargs=kwargs,
+            request=request,
+        )
 
     except Exception as exception:
         request.config.hook.pytest_bdd_step_error(exception=exception, **kw)

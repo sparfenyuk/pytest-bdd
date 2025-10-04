@@ -38,6 +38,7 @@ def _(article):
 from __future__ import annotations
 
 import enum
+import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import count
@@ -70,6 +71,7 @@ class StepFunctionContext:
     parser: StepParser
     converters: dict[str, Callable[[str], object]] = field(default_factory=dict)
     target_fixture: str | None = None
+    is_async: bool = False
 
 
 def get_step_fixture_name(step: Step) -> str:
@@ -163,12 +165,16 @@ def step(
     def decorator(func: Callable[P, T]) -> Callable[P, T]:
         parser = get_parser(name)
 
+        # Detect if the function is async
+        is_async = inspect.iscoroutinefunction(func)
+
         context = StepFunctionContext(
             type=type_,
             step_func=func,
             parser=parser,
             converters=converters,
             target_fixture=target_fixture,
+            is_async=is_async,
         )
 
         def step_function_marker() -> StepFunctionContext:
